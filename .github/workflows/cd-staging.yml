@@ -1,0 +1,261 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [ develop ]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-deployment
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=staging-latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          file: ./api/Dockerfile
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Generate deployment manifest
+        run: |
+          # Create deployment configuration
+          envsubst < deploy/staging/docker-compose.staging.yml > docker-compose.staging.yml
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT }}
+          script: |
+            set -e
+
+            # Create application directory
+            sudo mkdir -p /opt/wechat-work-archive
+            cd /opt/wechat-work-archive
+
+            # Backup current deployment
+            if [ -f docker-compose.yml ]; then
+              sudo cp docker-compose.yml docker-compose.yml.backup.$(date +%Y%m%d_%H%M%S)
+            fi
+
+            # Download latest docker-compose file
+            sudo curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              -o docker-compose.yml \
+              -L "https://api.github.com/repos/${{ github.repository }}/contents/docker/docker-compose.yml?ref=${{ github.sha }}"
+
+            # Download environment template
+            sudo curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              -o .env.template \
+              -L "https://api.github.com/repos/${{ github.repository }}/contents/.env.example?ref=${{ github.sha }}"
+
+            # Create staging environment file
+            sudo tee .env > /dev/null << EOF
+            # Staging Environment Configuration
+            CORP_ID=${{ secrets.STAGING_CORP_ID }}
+            SECRET=${{ secrets.STAGING_SECRET }}
+            ENCODING_AES_KEY=${{ secrets.STAGING_ENCODING_AES_KEY }}
+
+            # Database
+            DB_NAME=wechat_archive_staging
+            DB_USER=${{ secrets.STAGING_DB_USER }}
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }}
+
+            # Redis
+            REDIS_PASSWORD=${{ secrets.STAGING_REDIS_PASSWORD }}
+
+            # API Configuration
+            API_WORKERS=2
+            LOG_LEVEL=DEBUG
+            DEBUG=false
+
+            # Monitoring
+            GRAFANA_PASSWORD=${{ secrets.STAGING_GRAFANA_PASSWORD }}
+
+            # Security
+            SECRET_KEY=${{ secrets.STAGING_SECRET_KEY }}
+
+            # Image configuration
+            REGISTRY=${{ env.REGISTRY }}
+            IMAGE_NAME=${{ env.IMAGE_NAME }}
+            VERSION=${{ github.sha }}
+            EOF
+
+            # Login to container registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+            # Pull latest images
+            sudo docker-compose pull
+
+            # Stop existing services gracefully
+            sudo docker-compose down --timeout 30
+
+            # Start services
+            sudo docker-compose up -d
+
+            # Wait for services to be ready
+            echo "Waiting for services to start..."
+            sleep 30
+
+            # Check service health
+            for i in {1..30}; do
+              if sudo docker-compose exec -T api curl -f http://localhost:8000/health > /dev/null 2>&1; then
+                echo "✅ API is healthy"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ API health check failed"
+                sudo docker-compose logs api
+                exit 1
+              fi
+              echo "Waiting for API to be ready... ($i/30)"
+              sleep 5
+            done
+
+            # Run database migrations
+            echo "Running database migrations..."
+            sudo docker-compose exec -T api alembic upgrade head
+
+            # Clean up old images
+            sudo docker image prune -f
+
+            echo "✅ Staging deployment completed successfully"
+
+      - name: Run smoke tests
+        run: |
+          # Wait a bit more for full startup
+          sleep 30
+
+          # Basic health check
+          curl -f ${{ secrets.STAGING_URL }}/health
+
+          # API endpoint tests
+          curl -f ${{ secrets.STAGING_URL }}/api/v1/groups
+
+          echo "✅ Smoke tests passed"
+
+      - name: Run integration tests against staging
+        run: |
+          # Run integration tests against staging environment
+          cd api
+
+          # Install test dependencies
+          pip install -r requirements-dev.txt
+
+          # Run staging-specific tests
+          STAGING_URL=${{ secrets.STAGING_URL }} \
+          python -m pytest tests/staging/ -v --maxfail=5
+        continue-on-error: true
+
+      - name: Update deployment status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const deployment = await github.rest.repos.createDeployment({
+              owner,
+              repo,
+              ref: context.sha,
+              environment: 'staging',
+              auto_merge: false,
+              required_contexts: []
+            });
+
+            await github.rest.repos.createDeploymentStatus({
+              owner,
+              repo,
+              deployment_id: deployment.data.id,
+              state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
+              environment_url: '${{ secrets.STAGING_URL }}',
+              description: 'Staging deployment ${{ job.status }}'
+            });
+
+      - name: Rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT }}
+          script: |
+            cd /opt/wechat-work-archive
+
+            # Find latest backup
+            BACKUP_FILE=$(ls -t docker-compose.yml.backup.* 2>/dev/null | head -1)
+
+            if [ -n "$BACKUP_FILE" ]; then
+              echo "🔄 Rolling back to $BACKUP_FILE"
+              sudo cp "$BACKUP_FILE" docker-compose.yml
+              sudo docker-compose up -d
+              echo "✅ Rollback completed"
+            else
+              echo "❌ No backup found for rollback"
+            fi
+
+      - name: Notify team
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Staging Deployment: ${{ job.status }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            URL: ${{ secrets.STAGING_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true

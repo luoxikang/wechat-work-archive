@@ -1,0 +1,436 @@
+name: Deploy to Production
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to deploy'
+        required: true
+        type: string
+      skip_tests:
+        description: 'Skip pre-deployment tests'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  pre-deployment-checks:
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
+    outputs:
+      should_deploy: ${{ steps.checks.outputs.should_deploy }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      - name: Verify release readiness
+        id: checks
+        run: |
+          # Check if this is a production-ready release
+          TAG="${{ inputs.tag || github.event.release.tag_name }}"
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Invalid release tag format. Expected: v1.2.3"
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Check if staging deployment is healthy
+          echo "Checking staging deployment health..."
+          if ! curl -f ${{ secrets.STAGING_URL }}/health; then
+            echo "❌ Staging environment is not healthy"
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✅ Pre-deployment checks passed"
+          echo "should_deploy=true" >> $GITHUB_OUTPUT
+
+  deploy-production:
+    needs: [pre-deployment-checks]
+    runs-on: ubuntu-latest
+    environment: production
+    if: ${{ always() && (needs.pre-deployment-checks.outputs.should_deploy == 'true' || inputs.skip_tests) }}
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=production-latest
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          file: ./api/Dockerfile
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Create deployment notification
+        uses: actions/github-script@v7
+        id: deployment
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const deployment = await github.rest.repos.createDeployment({
+              owner,
+              repo,
+              ref: context.ref,
+              environment: 'production',
+              auto_merge: false,
+              required_contexts: [],
+              description: 'Production deployment via ${{ github.event_name }}'
+            });
+            return deployment.data.id;
+
+      - name: Deploy to production (Blue-Green strategy)
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          port: ${{ secrets.PRODUCTION_PORT }}
+          script: |
+            set -e
+
+            RELEASE_TAG="${{ inputs.tag || github.event.release.tag_name }}"
+            echo "🚀 Starting production deployment for $RELEASE_TAG"
+
+            # Create application directory
+            sudo mkdir -p /opt/wechat-work-archive
+            cd /opt/wechat-work-archive
+
+            # Create backup directory
+            BACKUP_DIR="/opt/backups/wechat-archive/$(date +%Y%m%d_%H%M%S)"
+            sudo mkdir -p "$BACKUP_DIR"
+
+            # Backup current state
+            echo "📦 Creating backup..."
+            if [ -f docker-compose.yml ]; then
+              sudo cp docker-compose.yml "$BACKUP_DIR/"
+            fi
+            if [ -f .env ]; then
+              sudo cp .env "$BACKUP_DIR/"
+            fi
+
+            # Backup database
+            if sudo docker-compose ps | grep -q postgres; then
+              echo "🗄️ Backing up database..."
+              sudo docker-compose exec -T postgres pg_dump -U ${{ secrets.PRODUCTION_DB_USER }} wechat_archive > "$BACKUP_DIR/database.sql"
+            fi
+
+            # Download latest deployment files
+            echo "📥 Downloading deployment configuration..."
+            sudo curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              -o docker-compose.yml \
+              -L "https://api.github.com/repos/${{ github.repository }}/contents/docker/docker-compose.yml?ref=$RELEASE_TAG"
+
+            # Create production environment file
+            sudo tee .env > /dev/null << EOF
+            # Production Environment Configuration
+            CORP_ID=${{ secrets.PRODUCTION_CORP_ID }}
+            SECRET=${{ secrets.PRODUCTION_SECRET }}
+            ENCODING_AES_KEY=${{ secrets.PRODUCTION_ENCODING_AES_KEY }}
+
+            # Database
+            DB_NAME=wechat_archive
+            DB_USER=${{ secrets.PRODUCTION_DB_USER }}
+            DB_PASSWORD=${{ secrets.PRODUCTION_DB_PASSWORD }}
+
+            # Redis
+            REDIS_PASSWORD=${{ secrets.PRODUCTION_REDIS_PASSWORD }}
+
+            # API Configuration
+            API_WORKERS=4
+            WORKER_REPLICAS=3
+            LOG_LEVEL=INFO
+            DEBUG=false
+
+            # Monitoring
+            GRAFANA_PASSWORD=${{ secrets.PRODUCTION_GRAFANA_PASSWORD }}
+
+            # Security
+            SECRET_KEY=${{ secrets.PRODUCTION_SECRET_KEY }}
+
+            # Domain
+            DOMAIN=${{ secrets.PRODUCTION_DOMAIN }}
+
+            # Image configuration
+            REGISTRY=${{ env.REGISTRY }}
+            IMAGE_NAME=${{ env.IMAGE_NAME }}
+            VERSION=$RELEASE_TAG
+            EOF
+
+            # Login to container registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+            # Blue-Green Deployment Strategy
+            echo "🔄 Starting blue-green deployment..."
+
+            # Scale up new instances (green)
+            sudo docker-compose up -d --scale api=2 --no-recreate
+
+            # Wait for new instances to be ready
+            echo "⏳ Waiting for new instances to be healthy..."
+            sleep 60
+
+            # Health check for new instances
+            for i in {1..30}; do
+              if sudo docker-compose exec api curl -f http://localhost:8000/health > /dev/null 2>&1; then
+                echo "✅ New instances are healthy"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ New instances health check failed"
+                # Rollback
+                sudo docker-compose down
+                sudo cp "$BACKUP_DIR/docker-compose.yml" . 2>/dev/null || true
+                sudo cp "$BACKUP_DIR/.env" . 2>/dev/null || true
+                sudo docker-compose up -d
+                exit 1
+              fi
+              sleep 5
+            done
+
+            # Run database migrations with backup
+            echo "🔄 Running database migrations..."
+            sudo docker-compose exec -T api alembic upgrade head || {
+              echo "❌ Migration failed, restoring database..."
+              if [ -f "$BACKUP_DIR/database.sql" ]; then
+                sudo docker-compose exec -T postgres psql -U ${{ secrets.PRODUCTION_DB_USER }} wechat_archive < "$BACKUP_DIR/database.sql"
+              fi
+              exit 1
+            }
+
+            # Switch traffic to green deployment
+            echo "🔀 Switching traffic to new deployment..."
+            sudo docker-compose up -d --remove-orphans
+
+            # Clean up old containers and images
+            sudo docker container prune -f
+            sudo docker image prune -f
+
+            # Keep only last 5 backups
+            sudo find /opt/backups/wechat-archive -type d -name "20*" | sort -r | tail -n +6 | sudo xargs rm -rf
+
+            echo "✅ Production deployment completed successfully"
+            echo "📊 Backup stored in: $BACKUP_DIR"
+
+      - name: Run production smoke tests
+        run: |
+          echo "🧪 Running production smoke tests..."
+          sleep 30
+
+          # Test critical endpoints
+          curl -f ${{ secrets.PRODUCTION_URL }}/health
+          curl -f ${{ secrets.PRODUCTION_URL }}/api/v1/groups
+
+          # Test metrics endpoint
+          curl -f ${{ secrets.PRODUCTION_URL }}/metrics
+
+          echo "✅ Production smoke tests passed"
+
+      - name: Verify deployment metrics
+        run: |
+          # Check if metrics are being collected
+          echo "📊 Verifying deployment metrics..."
+
+          # Query Prometheus for basic metrics
+          curl -f "${{ secrets.PRODUCTION_URL }}:9090/api/v1/query?query=up{job=\"wechat-api\"}"
+
+          echo "✅ Metrics verification completed"
+
+      - name: Update deployment status - Success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'success',
+              environment_url: '${{ secrets.PRODUCTION_URL }}',
+              description: 'Production deployment successful'
+            });
+
+      - name: Update deployment status - Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'failure',
+              environment_url: '${{ secrets.PRODUCTION_URL }}',
+              description: 'Production deployment failed'
+            });
+
+      - name: Emergency rollback
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          port: ${{ secrets.PRODUCTION_PORT }}
+          script: |
+            echo "🚨 Emergency rollback initiated..."
+            cd /opt/wechat-work-archive
+
+            # Find latest backup
+            LATEST_BACKUP=$(sudo find /opt/backups/wechat-archive -type d -name "20*" | sort -r | head -1)
+
+            if [ -n "$LATEST_BACKUP" ] && [ -d "$LATEST_BACKUP" ]; then
+              echo "🔄 Rolling back to $LATEST_BACKUP"
+
+              # Stop current services
+              sudo docker-compose down --timeout 30
+
+              # Restore configuration
+              if [ -f "$LATEST_BACKUP/docker-compose.yml" ]; then
+                sudo cp "$LATEST_BACKUP/docker-compose.yml" .
+              fi
+              if [ -f "$LATEST_BACKUP/.env" ]; then
+                sudo cp "$LATEST_BACKUP/.env" .
+              fi
+
+              # Restore database if needed
+              if [ -f "$LATEST_BACKUP/database.sql" ]; then
+                echo "🗄️ Restoring database..."
+                sudo docker-compose up -d postgres
+                sleep 30
+                sudo docker-compose exec -T postgres psql -U ${{ secrets.PRODUCTION_DB_USER }} wechat_archive < "$LATEST_BACKUP/database.sql"
+              fi
+
+              # Start services
+              sudo docker-compose up -d
+
+              echo "✅ Emergency rollback completed"
+            else
+              echo "❌ No backup found for rollback"
+              exit 1
+            fi
+
+  notify:
+    needs: [deploy-production]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Notify team on success
+        if: needs.deploy-production.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: |
+            🎉 Production Deployment Successful!
+            Release: ${{ inputs.tag || github.event.release.tag_name }}
+            Environment: ${{ secrets.PRODUCTION_URL }}
+            Deployed by: ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify team on failure
+        if: needs.deploy-production.result == 'failure'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            🚨 Production Deployment Failed!
+            Release: ${{ inputs.tag || github.event.release.tag_name }}
+            Please check the deployment logs and verify system status.
+            Automatic rollback may have been triggered.
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Create GitHub issue on failure
+        if: needs.deploy-production.result == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Production Deployment Failed - ${{ inputs.tag || github.event.release.tag_name }}`,
+              body: `
+                ## Production Deployment Failure
+
+                **Release**: ${{ inputs.tag || github.event.release.tag_name }}
+                **Trigger**: ${{ github.event_name }}
+                **Actor**: ${{ github.actor }}
+                **Workflow**: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+                ### Action Required
+                - [ ] Investigate deployment failure
+                - [ ] Verify system status
+                - [ ] Check if rollback was successful
+                - [ ] Fix underlying issues
+                - [ ] Plan re-deployment
+
+                ### Links
+                - [Production URL](${{ secrets.PRODUCTION_URL }})
+                - [Monitoring Dashboard](${{ secrets.PRODUCTION_URL }}:3000)
+                - [Deployment Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              `,
+              labels: ['bug', 'production', 'deployment', 'urgent']
+            });
+
+      - name: Update release on success
+        if: needs.deploy-production.result == 'success' && github.event_name == 'release'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ github.event.release.id }},
+              body: `${{ github.event.release.body }}
+
+              ---
+              ✅ **Deployed to Production**: ${{ github.event.release.published_at }}
+              🌐 **Production URL**: ${{ secrets.PRODUCTION_URL }}
+              📊 **Monitoring**: ${{ secrets.PRODUCTION_URL }}:3000
+              `
+            });

@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: wechat_postgres_test
+    environment:
+      POSTGRES_DB: wechat_archive_test
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - wechat_test_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-test:
+    image: redis:7-alpine
+    container_name: wechat_redis_test
+    command: redis-server --appendonly no --save ""
+    tmpfs:
+      - /data
+    ports:
+      - "6381:6379"
+    networks:
+      - wechat_test_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api-test:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: test
+    container_name: wechat_api_test
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://test_user:test_password@postgres-test:5432/wechat_archive_test
+      - REDIS_URL=redis://redis-test:6379/0
+      - CELERY_BROKER_URL=redis://redis-test:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis-test:6379/2
+      - LOG_LEVEL=DEBUG
+      - TESTING=true
+      - CORP_ID=test_corp_id
+      - SECRET=test_secret
+      - ENCODING_AES_KEY=test_encoding_key
+    volumes:
+      - ../api:/app
+      - test_logs:/app/logs
+    networks:
+      - wechat_test_network
+    command: >
+      sh -c "
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Running tests...' &&
+        pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=80
+      "
+
+  # Integration test service
+  integration-test:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: test
+    container_name: wechat_integration_test
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://test_user:test_password@postgres-test:5432/wechat_archive_test
+      - REDIS_URL=redis://redis-test:6379/0
+      - CELERY_BROKER_URL=redis://redis-test:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis-test:6379/2
+      - LOG_LEVEL=DEBUG
+      - TESTING=true
+    volumes:
+      - ../api:/app
+      - test_logs:/app/logs
+    networks:
+      - wechat_test_network
+    command: >
+      sh -c "
+        echo 'Starting API server for integration tests...' &&
+        uvicorn src.app:app --host 0.0.0.0 --port 8000 &
+        sleep 10 &&
+        echo 'Running integration tests...' &&
+        pytest tests/integration/ -v
+      "
+
+  # End-to-end test service
+  e2e-test:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: test
+    container_name: wechat_e2e_test
+    depends_on:
+      - api-test
+    environment:
+      - API_BASE_URL=http://api-test:8000
+      - DATABASE_URL=postgresql://test_user:test_password@postgres-test:5432/wechat_archive_test
+      - REDIS_URL=redis://redis-test:6379/0
+      - TESTING=true
+    volumes:
+      - ../api:/app
+      - test_logs:/app/logs
+    networks:
+      - wechat_test_network
+    command: >
+      sh -c "
+        echo 'Waiting for API to be ready...' &&
+        until curl -f http://api-test:8000/health; do sleep 2; done &&
+        echo 'Running end-to-end tests...' &&
+        pytest tests/e2e/ -v
+      "
+
+networks:
+  wechat_test_network:
+    driver: bridge
+
+volumes:
+  test_logs:
+    driver: local

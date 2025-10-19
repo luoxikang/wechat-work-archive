@@ -1,0 +1,273 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: wechat_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-wechat_archive}
+      POSTGRES_USER: ${DB_USER:-wechat_admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-wechat_admin}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    container_name: wechat_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  api:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: production
+    container_name: wechat_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - CORP_ID=${CORP_ID}
+      - SECRET=${SECRET}
+      - ENCODING_AES_KEY=${ENCODING_AES_KEY}
+      - DATABASE_URL=postgresql://${DB_USER:-wechat_admin}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-wechat_archive}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - WORKERS=${API_WORKERS:-4}
+    volumes:
+      - ../logs:/app/logs
+      - ../media:/app/media
+      - ../uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  scheduler:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: production
+    container_name: wechat_scheduler
+    command: celery -A src.tasks beat -l info --pidfile=/tmp/celerybeat.pid
+    depends_on:
+      - api
+      - redis
+    environment:
+      - CORP_ID=${CORP_ID}
+      - SECRET=${SECRET}
+      - ENCODING_AES_KEY=${ENCODING_AES_KEY}
+      - DATABASE_URL=postgresql://${DB_USER:-wechat_admin}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-wechat_archive}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/2
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ../logs:/app/logs
+      - celery_data:/tmp
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.2'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+
+  worker:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: production
+    container_name: wechat_worker
+    command: celery -A src.tasks worker -l info -c ${CELERY_WORKERS:-4} --max-tasks-per-child=1000
+    depends_on:
+      - api
+      - redis
+    environment:
+      - CORP_ID=${CORP_ID}
+      - SECRET=${SECRET}
+      - ENCODING_AES_KEY=${ENCODING_AES_KEY}
+      - DATABASE_URL=postgresql://${DB_USER:-wechat_admin}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-wechat_archive}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-}@redis:6379/2
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ../logs:/app/logs
+      - ../media:/app/media
+      - ../uploads:/app/uploads
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  nginx:
+    build:
+      context: ../nginx
+      dockerfile: Dockerfile
+    container_name: wechat_nginx
+    depends_on:
+      - api
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - API_UPSTREAM=api:8000
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx/certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+      - nginx_logs:/var/log/nginx
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.3'
+        reservations:
+          memory: 128M
+          cpus: '0.15'
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: wechat_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.3'
+        reservations:
+          memory: 256M
+          cpus: '0.15'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: wechat_grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - ../monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - wechat_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.2'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+
+networks:
+  wechat_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  nginx_cache:
+    driver: local
+  nginx_logs:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  celery_data:
+    driver: local

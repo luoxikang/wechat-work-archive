@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: wechat_postgres_dev
+    environment:
+      POSTGRES_DB: wechat_archive_dev
+      POSTGRES_USER: dev_user
+      POSTGRES_PASSWORD: dev_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - wechat_dev_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: wechat_redis_dev
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_dev_data:/data
+    ports:
+      - "6380:6379"
+    networks:
+      - wechat_dev_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Development API service (optional, can run locally)
+  api:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: development
+    container_name: wechat_api_dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - CORP_ID=test_corp_id
+      - SECRET=test_secret
+      - ENCODING_AES_KEY=test_encoding_key
+      - DATABASE_URL=postgresql://dev_user:dev_password@postgres:5432/wechat_archive_dev
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=DEBUG
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - RELOAD=true
+    volumes:
+      - ../api:/app
+      - ../logs:/app/logs
+      - ../media:/app/media
+    ports:
+      - "8001:8000"
+    networks:
+      - wechat_dev_network
+    restart: unless-stopped
+    command: uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
+
+  # Development worker (optional)
+  worker:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: development
+    container_name: wechat_worker_dev
+    depends_on:
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://dev_user:dev_password@postgres:5432/wechat_archive_dev
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ../api:/app
+      - ../logs:/app/logs
+    networks:
+      - wechat_dev_network
+    restart: unless-stopped
+    command: celery -A src.tasks worker -l debug -c 2
+
+  # Development monitoring
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: wechat_mailhog_dev
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - wechat_dev_network
+    restart: unless-stopped
+
+networks:
+  wechat_dev_network:
+    driver: bridge
+
+volumes:
+  postgres_dev_data:
+    driver: local
+  redis_dev_data:
+    driver: local
